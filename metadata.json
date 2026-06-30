@@ -1,0 +1,6 @@
+{
+  "name": "LifeSpanFit AI",
+  "description": "AI-powered personalized health, nutrition, and fitness guidance for every age, every stage of life.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
