@@ -14,7 +14,7 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // Lazy initialization of Gemini client
 let aiClient: GoogleGenAI | null = null;
@@ -430,8 +430,9 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  const listenPort = typeof PORT === 'string' ? parseInt(PORT, 10) : PORT;
+  app.listen(listenPort, "0.0.0.0", () => {
+    console.log(`Server running on port ${listenPort}`);
   });
 }
 
