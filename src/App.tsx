@@ -144,7 +144,7 @@ export default function App() {
   });
 
   // --- NAVIGATION STATE ---
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'assessment' | 'nutrition' | 'fitness' | 'tracker' | 'family' | 'chat'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'assessment' | 'nutrition' | 'fitness' | 'tracker' | 'family' | 'chat' | 'owner'>('dashboard');
 
   // --- INTERACTIVE PROFILE EDITOR STATE ---
   const [showAddProfileModal, setShowAddProfileModal] = useState(false);
@@ -195,6 +195,17 @@ export default function App() {
   // --- NOTIFICATION BANNER STATE ---
   const [toastMsg, setToastMsg] = useState<{ text: string; type: 'success' | 'info' | 'error' } | null>(null);
 
+  // --- OWNER & SYNC BACKEND STATE ---
+  const [isOwnerAuthorized, setIsOwnerAuthorized] = useState<boolean>(false);
+  const [ownerPasscodeInput, setOwnerPasscodeInput] = useState<string>('');
+  const [adminStats, setAdminStats] = useState<any>(null);
+  const [selectedAdminUser, setSelectedAdminUser] = useState<any>(null);
+  const [isStatsLoading, setIsStatsLoading] = useState<boolean>(false);
+  const [statsError, setStatsError] = useState<string | null>(null);
+  const [systemPromptInput, setSystemPromptInput] = useState<string>('');
+  const [newPasscodeInput, setNewPasscodeInput] = useState<string>('');
+  const [isSavingAdminSettings, setIsSavingAdminSettings] = useState<boolean>(false);
+
   // --- PERSISTENCE SYNCHRONIZER ---
   useEffect(() => {
     localStorage.setItem('lsf_profiles', JSON.stringify(profiles));
@@ -215,6 +226,98 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('lsf_chats', JSON.stringify(chatHistories));
   }, [chatHistories]);
+
+  // Sync with Express backend helper
+  const syncWithBackend = async (
+    currentProfiles = profiles,
+    currentTrackers = trackerHistory,
+    currentAssessments = assessments,
+    currentChats = chatHistories
+  ) => {
+    if (!user || !user.email) return;
+    try {
+      await fetch('/api/sync/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: user.email,
+          name: user.name,
+          profiles: currentProfiles,
+          trackerHistory: currentTrackers,
+          assessments: currentAssessments,
+          chatHistories: currentChats
+        })
+      });
+    } catch (err) {
+      console.error('Failed to sync workspace with backend:', err);
+    }
+  };
+
+  // Load from Express backend helper
+  const loadFromBackend = async (email: string) => {
+    try {
+      const response = await fetch('/api/sync/load', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      });
+      if (response.ok) {
+        const resData = await response.json();
+        if (resData.found && resData.data) {
+          const d = resData.data;
+          if (d.profiles && d.profiles.length > 0) setProfiles(d.profiles);
+          if (d.trackerHistory) setTrackerHistory(d.trackerHistory);
+          if (d.assessments) setAssessments(d.assessments);
+          if (d.chatHistories) setChatHistories(d.chatHistories);
+          triggerToast("Successfully synced cloud backup with local workspace!", "success");
+        } else {
+          // First login, upload initial local mock data as starter cloud backup
+          fetch('/api/sync/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              email,
+              name: user?.name || email.split('@')[0],
+              profiles,
+              trackerHistory,
+              assessments,
+              chatHistories
+            })
+          }).catch(err => console.error("Initial cloud backup creation failed", err));
+        }
+      }
+    } catch (err) {
+      console.error('Failed to load cloud backup:', err);
+    }
+  };
+
+  // Debounced auto-sync when local state changes
+  useEffect(() => {
+    if (!user || !user.email) return;
+    const t = setTimeout(() => {
+      syncWithBackend(profiles, trackerHistory, assessments, chatHistories);
+    }, 2000);
+    return () => clearTimeout(t);
+  }, [profiles, trackerHistory, assessments, chatHistories, user]);
+
+  // Initial cloud mounting sync
+  useEffect(() => {
+    if (user && user.email) {
+      loadFromBackend(user.email);
+    }
+  }, []);
+
+  // Auto-refresh stats when owner panel tab is visited
+  useEffect(() => {
+    if (activeTab === 'owner') {
+      const savedPasscode = sessionStorage.getItem('lsf_owner_passcode');
+      if (savedPasscode) {
+        setOwnerPasscodeInput(savedPasscode);
+        setIsOwnerAuthorized(true);
+        fetchAdminStats(savedPasscode);
+      }
+    }
+  }, [activeTab]);
 
   // Toast trigger helper
   const triggerToast = (text: string, type: 'success' | 'info' | 'error' = 'success') => {
@@ -265,7 +368,7 @@ export default function App() {
   }, [activeProfileId]);
 
   // Handle User Login
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!authEmail) return;
     const cleanUser = {
@@ -275,12 +378,105 @@ export default function App() {
     setUser(cleanUser);
     localStorage.setItem('lsf_user', JSON.stringify(cleanUser));
     triggerToast(`Logged in successfully as ${cleanUser.name}!`);
+    await loadFromBackend(cleanUser.email);
   };
 
   const handleLogout = () => {
     setUser(null);
     localStorage.removeItem('lsf_user');
     triggerToast("Logged out of session.", "info");
+  };
+
+  // --- ADMIN AND OWNER INTERFACE HANDLERS ---
+  const handleVerifyOwnerPasscode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      const response = await fetch('/api/admin/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passcode: ownerPasscodeInput })
+      });
+      if (response.ok) {
+        setIsOwnerAuthorized(true);
+        triggerToast("Access granted to Owner Panel!", "success");
+        sessionStorage.setItem('lsf_owner_passcode', ownerPasscodeInput);
+        fetchAdminStats(ownerPasscodeInput);
+      } else {
+        triggerToast("Invalid owner passcode. Check configured environment variables.", "error");
+      }
+    } catch (err) {
+      console.error(err);
+      triggerToast("Server validation failed.", "error");
+    }
+  };
+
+  const fetchAdminStats = async (passcodeToUse = ownerPasscodeInput) => {
+    setIsStatsLoading(true);
+    setStatsError(null);
+    try {
+      const passcode = passcodeToUse || sessionStorage.getItem('lsf_owner_passcode') || '';
+      const response = await fetch('/api/admin/summary', {
+        headers: { 'X-Owner-Passcode': passcode }
+      });
+      if (!response.ok) throw new Error("Could not retrieve admin dashboard stats");
+      const data = await response.json();
+      setAdminStats(data);
+      setSystemPromptInput(data.appSettings?.systemPrompt || '');
+    } catch (err: any) {
+      console.error(err);
+      setStatsError(err.message || "Failed to load dashboard data");
+    } finally {
+      setIsStatsLoading(false);
+    }
+  };
+
+  const handleSaveAdminSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSavingAdminSettings(true);
+    try {
+      const passcode = ownerPasscodeInput || sessionStorage.getItem('lsf_owner_passcode') || '';
+      const response = await fetch('/api/admin/settings/update', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-Owner-Passcode': passcode
+        },
+        body: JSON.stringify({
+          systemPrompt: systemPromptInput,
+          ownerPasscode: newPasscodeInput || undefined
+        })
+      });
+      if (!response.ok) throw new Error("Settings update failed");
+      triggerToast("System prompts and settings updated successfully on backend!", "success");
+      
+      if (newPasscodeInput) {
+        setOwnerPasscodeInput(newPasscodeInput);
+        sessionStorage.setItem('lsf_owner_passcode', newPasscodeInput);
+        setNewPasscodeInput('');
+      }
+
+      fetchAdminStats(newPasscodeInput || passcode);
+    } catch (err: any) {
+      console.error(err);
+      triggerToast(err.message || "Failed to save settings", "error");
+    } finally {
+      setIsSavingAdminSettings(false);
+    }
+  };
+
+  const fetchSelectedUserDetails = async (email: string) => {
+    try {
+      const passcode = ownerPasscodeInput || sessionStorage.getItem('lsf_owner_passcode') || '';
+      const response = await fetch(`/api/admin/user-details?email=${encodeURIComponent(email)}`, {
+        headers: { 'X-Owner-Passcode': passcode }
+      });
+      if (!response.ok) throw new Error("Could not load user data details");
+      const data = await response.json();
+      setSelectedAdminUser(data);
+    } catch (err: any) {
+      console.error(err);
+      triggerToast(err.message || "Failed to load logs", "error");
+    }
   };
 
   // Handle Add Profile
@@ -885,6 +1081,23 @@ export default function App() {
                     <span>Clinical Chat</span>
                     <span className="text-[9px] text-emerald-600 bg-emerald-50 px-1 py-0.2 rounded-md font-bold">24/7</span>
                   </div>
+                </div>
+                <ChevronRight className="w-3.5 h-3.5 opacity-60" />
+              </button>
+
+              <div className="px-3 py-2 text-[10px] font-bold text-slate-400 uppercase tracking-wider mt-4 mb-2">
+                Administration
+              </div>
+
+              <button 
+                onClick={() => setActiveTab('owner')}
+                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-semibold transition cursor-pointer ${
+                  activeTab === 'owner' ? 'bg-slate-100 text-purple-600' : 'text-slate-500 hover:bg-slate-100'
+                }`}
+              >
+                <div className="flex items-center gap-2.5">
+                  <Flame className="w-4 h-4 text-purple-600" />
+                  <span>Owner Panel</span>
                 </div>
                 <ChevronRight className="w-3.5 h-3.5 opacity-60" />
               </button>
@@ -2920,6 +3133,327 @@ export default function App() {
                       Ask AI
                     </button>
                   </div>
+
+                </div>
+              )}
+
+              {/* --- TAB 8: OWNER & ADMIN PANEL --- */}
+              {activeTab === 'owner' && (
+                <div className="space-y-6">
+                  
+                  {/* Lock Screen if not authorized */}
+                  {!isOwnerAuthorized ? (
+                    <div className="max-w-md mx-auto bg-white border border-slate-200/80 p-8 rounded-3xl shadow-xl space-y-6 my-12">
+                      <div className="text-center space-y-2">
+                        <div className="mx-auto w-12 h-12 bg-purple-100 rounded-2xl flex items-center justify-center text-purple-700">
+                          <Flame className="w-6 h-6 animate-pulse" />
+                        </div>
+                        <h2 className="text-lg font-bold text-slate-900">Owner Control Panel</h2>
+                        <p className="text-xs text-slate-500 max-w-sm mx-auto">
+                          Enter your administrative credentials to configure AI parameters, audit active user profiles, and review real-time client sync logs.
+                        </p>
+                      </div>
+
+                      <form onSubmit={handleVerifyOwnerPasscode} className="space-y-4">
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Administrative Passcode</label>
+                          <input 
+                            type="password" 
+                            required
+                            placeholder="••••••••••••"
+                            value={ownerPasscodeInput}
+                            onChange={e => setOwnerPasscodeInput(e.target.value)}
+                            className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500 text-sm text-center font-mono"
+                          />
+                        </div>
+
+                        <button 
+                          type="submit"
+                          className="w-full bg-purple-700 hover:bg-purple-800 text-white font-semibold py-3 rounded-xl text-xs shadow-md transition cursor-pointer flex items-center justify-center gap-2"
+                        >
+                          <CheckCircle2 className="w-4 h-4" />
+                          <span>Unlock Administrator Workspace</span>
+                        </button>
+                      </form>
+
+                      <div className="border-t border-slate-100 pt-4 text-center">
+                        <p className="text-[9px] text-slate-400">
+                          *Manage passcode via <code className="font-mono bg-slate-50 px-1 py-0.5 rounded">OWNER_PASSCODE</code> in the environment variables (Defaults to <code className="font-mono font-bold">owner2026</code>).
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-6">
+                      
+                      {/* Authorized Panel Header */}
+                      <div className="bg-white border border-slate-200/80 p-6 rounded-3xl shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+                        <div>
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className="text-[10px] font-bold text-purple-700 bg-purple-50 px-2.5 py-0.5 rounded-full uppercase tracking-wider">System Administration</span>
+                            <span className="text-[10px] font-mono text-slate-500 bg-slate-100 px-2 py-0.5 rounded-md">Live Connection</span>
+                          </div>
+                          <h2 className="text-xl font-bold text-slate-900 tracking-tight">Administrative Control Center</h2>
+                          <p className="text-xs text-slate-500 mt-1">
+                            Real-time client telemetry synchronization, Google Gemini instruction tuning, and patient logs database auditing.
+                          </p>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button 
+                            onClick={() => fetchAdminStats()}
+                            disabled={isStatsLoading}
+                            className="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 font-semibold text-xs px-4 py-2.5 rounded-xl transition cursor-pointer"
+                          >
+                            <RefreshCw className={`w-3.5 h-3.5 ${isStatsLoading ? 'animate-spin' : ''}`} />
+                            <span>Refresh Logs</span>
+                          </button>
+                          <button 
+                            onClick={() => {
+                              setIsOwnerAuthorized(false);
+                              sessionStorage.removeItem('lsf_owner_passcode');
+                              triggerToast("Owner session locked.");
+                            }}
+                            className="text-xs font-semibold text-rose-600 hover:bg-rose-50 border border-rose-200 px-3 py-2.5 rounded-xl cursor-pointer"
+                          >
+                            Lock Session
+                          </button>
+                        </div>
+                      </div>
+
+                      {isStatsLoading && !adminStats ? (
+                        <div className="bg-white border border-slate-200/80 p-12 rounded-3xl text-center space-y-2">
+                          <Loader2 className="w-8 h-8 text-purple-600 animate-spin mx-auto" />
+                          <p className="text-xs text-slate-500">Querying patient synchronization records and metrics...</p>
+                        </div>
+                      ) : statsError ? (
+                        <div className="bg-red-50 border border-red-200 p-6 rounded-3xl text-center space-y-2 text-red-800">
+                          <AlertCircle className="w-8 h-8 text-red-600 mx-auto" />
+                          <h3 className="font-bold text-sm">Failed to Fetch Server Logs</h3>
+                          <p className="text-xs">{statsError}</p>
+                          <button onClick={() => fetchAdminStats()} className="text-xs underline font-bold">Try Again</button>
+                        </div>
+                      ) : adminStats && (
+                        <div className="space-y-6">
+                          
+                          {/* Top Row Metrics Grid */}
+                          <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+                            
+                            <div className="bg-white border border-slate-200/80 p-5 rounded-2xl shadow-sm">
+                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Synced Accounts</span>
+                              <span className="text-3xl font-black text-purple-700 font-mono block mt-1">{adminStats.totalUsers}</span>
+                              <span className="text-[9px] text-slate-500 block mt-1">Unique registered client emails</span>
+                            </div>
+
+                            <div className="bg-white border border-slate-200/80 p-5 rounded-2xl shadow-sm">
+                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Total Member Profiles</span>
+                              <span className="text-3xl font-black text-indigo-700 font-mono block mt-1">{adminStats.totalProfiles}</span>
+                              <span className="text-[9px] text-slate-500 block mt-1">Sum of all family members onboarded</span>
+                            </div>
+
+                            <div className="bg-white border border-slate-200/80 p-5 rounded-2xl shadow-sm">
+                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Eaten Meals Logged</span>
+                              <span className="text-3xl font-black text-emerald-700 font-mono block mt-1">{adminStats.totalMealsLogged}</span>
+                              <span className="text-[9px] text-slate-500 block mt-1">Aggregated diet tracker inputs</span>
+                            </div>
+
+                            <div className="bg-white border border-slate-200/80 p-5 rounded-2xl shadow-sm">
+                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Assessments & Chats</span>
+                              <span className="text-3xl font-black text-amber-700 font-mono block mt-1">
+                                {adminStats.totalAssessments} <span className="text-xs font-normal text-slate-400">/</span> {adminStats.totalChatsLogged}
+                              </span>
+                              <span className="text-[9px] text-slate-500 block mt-1">Total clinical reports / messages</span>
+                            </div>
+
+                          </div>
+
+                          {/* Split layout: Synced Directory VS Custom prompt settings */}
+                          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                            
+                            {/* Directory of synced accounts (Left col) */}
+                            <div className="lg:col-span-5 bg-white border border-slate-200/80 p-5 rounded-3xl shadow-sm space-y-4 text-left">
+                              <div>
+                                <h3 className="text-sm font-bold text-slate-900">Synchronized Practitioner Directory</h3>
+                                <p className="text-[11px] text-slate-500 mt-0.5">Select a practitioner email to audit patient profiles, food intake logs, and AI chats.</p>
+                              </div>
+
+                              <div className="space-y-2 max-h-[500px] overflow-y-auto pr-1">
+                                {adminStats.users?.length === 0 ? (
+                                  <p className="text-xs text-slate-400 italic text-center py-6">No client synchronization backups found on server disk.</p>
+                                ) : (
+                                  adminStats.users?.map((u: any) => (
+                                    <div 
+                                      key={u.email}
+                                      className={`p-3.5 rounded-xl border transition-all cursor-pointer text-left space-y-2 ${
+                                        selectedAdminUser?.email === u.email 
+                                          ? 'border-purple-500 bg-purple-50/10' 
+                                          : 'border-slate-200 hover:border-slate-300 bg-slate-50/30'
+                                      }`}
+                                      onClick={() => fetchSelectedUserDetails(u.email)}
+                                    >
+                                      <div className="flex items-start justify-between gap-2">
+                                        <div className="min-w-0">
+                                          <h4 className="text-xs font-bold text-slate-900 truncate">{u.name}</h4>
+                                          <span className="text-[10px] text-slate-400 font-mono block truncate">{u.email}</span>
+                                        </div>
+                                        <span className="text-[9px] text-slate-500 bg-white border border-slate-200 px-1.5 py-0.5 rounded font-medium shrink-0">
+                                          {u.profilesCount} profiles
+                                        </span>
+                                      </div>
+
+                                      <div className="grid grid-cols-3 gap-1.5 pt-1.5 border-t border-slate-100/60 text-[9px] font-medium text-slate-500 font-mono">
+                                        <div>Meals: <span className="text-slate-800 font-bold">{u.mealsCount}</span></div>
+                                        <div>Chats: <span className="text-slate-800 font-bold">{u.chatsCount}</span></div>
+                                        <div>Assess: <span className="text-slate-800 font-bold">{u.assessmentsCount}</span></div>
+                                      </div>
+
+                                      <div className="text-[8px] text-slate-400 pt-0.5 flex items-center justify-between">
+                                        <span>Last Sync: {new Date(u.lastSynced).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+                                        <span className="text-[9px] font-bold text-purple-700 uppercase flex items-center gap-0.5">
+                                          Inspect Logs <ChevronRight className="w-2.5 h-2.5" />
+                                        </span>
+                                      </div>
+                                    </div>
+                                  ))
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Custom prompt settings / User inspector panel (Right col) */}
+                            <div className="lg:col-span-7 space-y-6">
+                              
+                              {/* Inspector Panel */}
+                              {selectedAdminUser ? (
+                                <div className="bg-white border border-slate-200/80 p-5 rounded-3xl shadow-sm space-y-4 text-left">
+                                  <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                                    <div>
+                                      <span className="text-[9px] font-bold text-purple-800 bg-purple-50 px-2 py-0.5 rounded">Audit Inspector</span>
+                                      <h3 className="text-sm font-bold text-slate-900 mt-1">Telemetry: {selectedAdminUser.name}</h3>
+                                      <p className="text-[10px] text-slate-400 font-mono">{selectedAdminUser.email}</p>
+                                    </div>
+                                    <button 
+                                      onClick={() => setSelectedAdminUser(null)}
+                                      className="text-xs text-slate-500 hover:text-slate-700 bg-slate-100 hover:bg-slate-200 px-3 py-1.5 rounded-xl cursor-pointer"
+                                    >
+                                      Close Inspect
+                                    </button>
+                                  </div>
+
+                                  {/* Profiles sub-section */}
+                                  <div className="space-y-3">
+                                    <h4 className="text-xs font-bold text-slate-900 border-l-2 border-purple-500 pl-2">Registered Patient Profiles</h4>
+                                    
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[220px] overflow-y-auto pr-1">
+                                      {selectedAdminUser.profiles?.map((p: any) => (
+                                        <div key={p.id} className="p-3 bg-slate-50 border border-slate-200/60 rounded-xl space-y-1.5 text-xs">
+                                          <div className="flex items-center justify-between gap-1">
+                                            <span className="font-bold text-slate-800 truncate">{p.name}</span>
+                                            <span className="text-[9px] bg-slate-200/60 text-slate-600 px-1.5 rounded font-mono uppercase font-bold shrink-0">{p.relation}</span>
+                                          </div>
+                                          <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] text-slate-500">
+                                            <div>Age: <span className="font-semibold text-slate-800">{p.age} yrs</span></div>
+                                            <div>Goal: <span className="font-semibold text-slate-800 line-clamp-1">{p.goals}</span></div>
+                                            <div>Height: <span className="font-semibold text-slate-800">{p.height} cm</span></div>
+                                            <div>Weight: <span className="font-semibold text-slate-800">{p.weight} kg</span></div>
+                                            <div className="col-span-2">Diet: <span className="font-semibold text-slate-800">{p.dietPreference}</span></div>
+                                          </div>
+                                          {p.medicalConditions?.length > 0 && (
+                                            <div className="text-[9px] bg-rose-50 text-rose-800 p-1 px-1.5 rounded border border-rose-100/50 truncate">
+                                              Medical: {p.medicalConditions.join(", ")}
+                                            </div>
+                                          )}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+
+                                  {/* Chat Auditing sub-section */}
+                                  <div className="space-y-3 pt-2 border-t border-slate-100">
+                                    <h4 className="text-xs font-bold text-slate-900 border-l-2 border-indigo-500 pl-2">Active Chat Audits</h4>
+                                    
+                                    <div className="max-h-[250px] overflow-y-auto bg-slate-50 rounded-2xl p-3 border border-slate-200/60 space-y-3 text-left">
+                                      {Object.entries(selectedAdminUser.chatHistories || {}).length === 0 ? (
+                                        <p className="text-[11px] text-slate-400 italic text-center py-4">No active chatbot interactions logged for any profile.</p>
+                                      ) : (
+                                        Object.entries(selectedAdminUser.chatHistories || {}).map(([profileId, chats]: any) => {
+                                          const prof = selectedAdminUser.profiles?.find((p: any) => p.id === profileId);
+                                          return (
+                                            <div key={profileId} className="space-y-2">
+                                              <div className="text-[9px] font-bold text-indigo-700 bg-indigo-50/50 px-2 py-0.5 rounded border border-indigo-100/50 inline-block">
+                                                Profile: {prof?.name || profileId}
+                                              </div>
+                                              {chats.length === 0 ? (
+                                                <p className="text-[10px] text-slate-400 italic pl-2">Chat empty.</p>
+                                              ) : (
+                                                <div className="space-y-2.5 pl-2 border-l border-slate-200">
+                                                  {chats.map((c: any, index: number) => (
+                                                    <div key={index} className="space-y-1">
+                                                      <span className={`text-[9px] font-bold block ${c.role === 'user' ? 'text-slate-800' : 'text-emerald-700'}`}>
+                                                        {c.role === 'user' ? 'User' : 'AI Companion'}
+                                                      </span>
+                                                      <p className="text-[10px] text-slate-600 bg-white p-2 rounded-lg border border-slate-100 whitespace-pre-wrap">{c.content}</p>
+                                                    </div>
+                                                  ))}
+                                                </div>
+                                              )}
+                                            </div>
+                                          );
+                                        })
+                                      )}
+                                    </div>
+                                  </div>
+
+                                </div>
+                              ) : (
+                                <div className="bg-white border border-slate-200/80 p-5 rounded-3xl shadow-sm space-y-4 text-left">
+                                  <div>
+                                    <h3 className="text-sm font-bold text-slate-900">Configure AI Settings & Prompt Instructions</h3>
+                                    <p className="text-[11px] text-slate-500 mt-0.5">Tune the clinical expertise persona and guidelines of Google Gemini model used for chatbot.</p>
+                                  </div>
+
+                                  <form onSubmit={handleSaveAdminSettings} className="space-y-4">
+                                    <div>
+                                      <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Clinical AI System Prompt (Instructions)</label>
+                                      <textarea 
+                                        rows={8}
+                                        value={systemPromptInput}
+                                        onChange={e => setSystemPromptInput(e.target.value)}
+                                        className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs font-mono focus:outline-none focus:ring-1 focus:ring-purple-500 leading-relaxed"
+                                        placeholder="Customize the clinical dietitian persona instructions..."
+                                      />
+                                    </div>
+
+                                    <div>
+                                      <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Update Owner Passcode (Leave blank to keep current)</label>
+                                      <input 
+                                        type="text" 
+                                        placeholder="Enter new owner passcode to replace default"
+                                        value={newPasscodeInput}
+                                        onChange={e => setNewPasscodeInput(e.target.value)}
+                                        className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-1 focus:ring-purple-500 font-mono"
+                                      />
+                                    </div>
+
+                                    <button 
+                                      type="submit"
+                                      disabled={isSavingAdminSettings}
+                                      className="w-full bg-purple-700 hover:bg-purple-800 text-white font-bold py-2.5 rounded-xl text-xs transition cursor-pointer flex items-center justify-center gap-1.5 disabled:opacity-50"
+                                    >
+                                      <Sparkles className="w-4 h-4" />
+                                      <span>{isSavingAdminSettings ? "Saving Settings..." : "Save AI System Configurations"}</span>
+                                    </button>
+                                  </form>
+                                </div>
+                              )}
+
+                            </div>
+
+                          </div>
+
+                        </div>
+                      )}
+
+                    </div>
+                  )}
 
                 </div>
               )}

@@ -7,11 +7,48 @@ import express from "express";
 import path from "path";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import fs from "fs";
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
+
+// Persistent File System Setup for Syncing and Owner Settings
+const DATA_DIR = path.join(process.cwd(), "data");
+const USERS_DIR = path.join(DATA_DIR, "users");
+
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+if (!fs.existsSync(USERS_DIR)) {
+  fs.mkdirSync(USERS_DIR, { recursive: true });
+}
+
+// App Settings & Custom AI Prompt Persistence
+const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
+let appSettings = {
+  systemPrompt: `You are LifeSpanFit AI's clinical digital dietitian, expert nutritionist, physical therapist, and wellness coach.
+You provide scientifically backed, empathetic, and clear wellness guidance tailored exactly to the active profile's life stage, age, physical stats, goals, diet preferences, body measurements, and body type (Ectomorph, Mesomorph, Endomorph).
+Maintain a professional, encouraging, and medical-grade tone. Keep answers concise but comprehensive, using clean markdown, list items, and bold labels.
+Always emphasize safe, age-specific practices. When advising on workouts, tailor the advice to their body type and measurements. For nutrition, give explicit meal examples: e.g., "Low Carbs & Low Fat" for Weight Loss, "High Carbs & High Protein" for Muscle Gain/Weight Gain.`,
+  ownerPasscode: process.env.OWNER_PASSCODE || "owner2026"
+};
+
+if (fs.existsSync(SETTINGS_FILE)) {
+  try {
+    const loaded = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+    appSettings = { ...appSettings, ...loaded };
+  } catch (err) {
+    console.error("Failed to load settings file:", err);
+  }
+} else {
+  try {
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(appSettings, null, 2), "utf8");
+  } catch (err) {
+    console.error("Failed to write initial settings file:", err);
+  }
+}
 
 const PORT = process.env.PORT || 3000;
 
@@ -95,10 +132,8 @@ Body Fat %: ${profile.bodyFat ? profile.bodyFat + "%" : "Not provided"}
 Body Type: ${profile.bodyType || "Not Specified"}
 `;
 
-    const systemInstruction = `You are LifeSpanFit AI's clinical digital dietitian, expert nutritionist, physical therapist, and wellness coach.
-You provide scientifically backed, empathetic, and clear wellness guidance tailored exactly to the active profile's life stage, age, physical stats, goals, diet preferences, body measurements, and body type (Ectomorph, Mesomorph, Endomorph).
-Maintain a professional, encouraging, and medical-grade tone. Keep answers concise but comprehensive, using clean markdown, list items, and bold labels.
-Always emphasize safe, age-specific practices. When advising on workouts, tailor the advice to their body type and measurements. For nutrition, give explicit meal examples: e.g., "Low Carbs & Low Fat" for Weight Loss, "High Carbs & High Protein" for Muscle Gain/Weight Gain.
+    const systemInstruction = `${appSettings.systemPrompt}
+
 Here is the active user profile you are currently advising:
 ${profileDetails}
 Always refer to the user by their name (${profile.name}) occasionally to personalize the experience. Mention if their request aligns with their goals or physical stats.`;
@@ -410,6 +445,214 @@ function generateSimulatedAssessment(profile: any, tracker: any[]): any {
     ]
   };
 }
+
+// --- SYNC & OWNER BACKEND ROUTES ---
+
+// Save User Sync data
+app.post("/api/sync/save", (req: express.Request, res: express.Response): any => {
+  const { email, name, profiles, trackerHistory, assessments, chatHistories } = req.body;
+  
+  if (!email) {
+    return res.status(400).json({ error: "Email is required to sync" });
+  }
+
+  const sanitizedEmail = email.toLowerCase().replace(/[^a-z0-9@._-]/g, "");
+  const filePath = path.join(USERS_DIR, `${sanitizedEmail}.json`);
+
+  const userData = {
+    email: email.toLowerCase(),
+    name: name || email.split("@")[0],
+    lastSynced: new Date().toISOString(),
+    profiles: profiles || [],
+    trackerHistory: trackerHistory || {},
+    assessments: assessments || {},
+    chatHistories: chatHistories || {}
+  };
+
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(userData, null, 2), "utf8");
+    res.json({ success: true, lastSynced: userData.lastSynced });
+  } catch (err: any) {
+    console.error(`Failed to save user sync data for ${email}:`, err);
+    res.status(500).json({ error: "Failed to save data on server" });
+  }
+});
+
+// Load User Sync data
+app.post("/api/sync/load", (req: express.Request, res: express.Response): any => {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: "Email is required to load" });
+  }
+
+  const sanitizedEmail = email.toLowerCase().replace(/[^a-z0-9@._-]/g, "");
+  const filePath = path.join(USERS_DIR, `${sanitizedEmail}.json`);
+
+  if (!fs.existsSync(filePath)) {
+    return res.json({ found: false });
+  }
+
+  try {
+    const data = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    res.json({ found: true, data });
+  } catch (err) {
+    console.error(`Failed to read user sync data for ${email}:`, err);
+    res.status(500).json({ error: "Failed to read data from server" });
+  }
+});
+
+// Admin Authorization Middleware (Check passcode in Headers)
+const checkAdminPasscode = (req: express.Request, res: express.Response, next: express.NextFunction): any => {
+  const authHeader = req.headers["x-owner-passcode"];
+  if (!authHeader || authHeader !== appSettings.ownerPasscode) {
+    return res.status(401).json({ error: "Unauthorized: Invalid owner passcode" });
+  }
+  next();
+};
+
+// Admin: Verify passcode
+app.post("/api/admin/verify", (req: express.Request, res: express.Response): any => {
+  const { passcode } = req.body;
+  if (passcode === appSettings.ownerPasscode) {
+    res.json({ success: true, message: "Passcode verified successfully" });
+  } else {
+    res.status(401).json({ error: "Invalid owner passcode" });
+  }
+});
+
+// Admin: Get Summary Dashboard Stats
+app.get("/api/admin/summary", checkAdminPasscode, (req: express.Request, res: express.Response): any => {
+  try {
+    const files = fs.readdirSync(USERS_DIR).filter(file => file.endsWith(".json"));
+    
+    let totalProfiles = 0;
+    let totalMealsLogged = 0;
+    let totalChatsLogged = 0;
+    let totalAssessments = 0;
+    
+    const goalsBreakdown: Record<string, number> = {};
+    const activityBreakdown: Record<string, number> = {};
+    const relationBreakdown: Record<string, number> = {};
+    const usersList: any[] = [];
+
+    for (const file of files) {
+      try {
+        const filePath = path.join(USERS_DIR, file);
+        const data = JSON.parse(fs.readFileSync(filePath, "utf8"));
+        
+        const userProfilesCount = data.profiles?.length || 0;
+        totalProfiles += userProfilesCount;
+        
+        let userMealsCount = 0;
+        if (data.trackerHistory) {
+          Object.values(data.trackerHistory).forEach((trackers: any) => {
+            if (Array.isArray(trackers)) {
+              trackers.forEach(t => {
+                userMealsCount += t.mealsLogged?.length || 0;
+              });
+            }
+          });
+        }
+        totalMealsLogged += userMealsCount;
+
+        let userChatsCount = 0;
+        if (data.chatHistories) {
+          Object.values(data.chatHistories).forEach((chats: any) => {
+            if (Array.isArray(chats)) {
+              userChatsCount += chats.length;
+            }
+          });
+        }
+        totalChatsLogged += userChatsCount;
+
+        const userAssessmentsCount = Object.keys(data.assessments || {}).length;
+        totalAssessments += userAssessmentsCount;
+
+        // Breakdowns
+        if (Array.isArray(data.profiles)) {
+          data.profiles.forEach((p: any) => {
+            if (p.goals) goalsBreakdown[p.goals] = (goalsBreakdown[p.goals] || 0) + 1;
+            if (p.activityLevel) activityBreakdown[p.activityLevel] = (activityBreakdown[p.activityLevel] || 0) + 1;
+            if (p.relation) relationBreakdown[p.relation] = (relationBreakdown[p.relation] || 0) + 1;
+          });
+        }
+
+        usersList.push({
+          email: data.email,
+          name: data.name,
+          lastSynced: data.lastSynced,
+          profilesCount: userProfilesCount,
+          mealsCount: userMealsCount,
+          chatsCount: userChatsCount,
+          assessmentsCount: userAssessmentsCount
+        });
+      } catch (err) {
+        console.warn(`Error reading details of file ${file}:`, err);
+      }
+    }
+
+    res.json({
+      totalUsers: files.length,
+      totalProfiles,
+      totalMealsLogged,
+      totalChatsLogged,
+      totalAssessments,
+      goalsBreakdown,
+      activityBreakdown,
+      relationBreakdown,
+      users: usersList,
+      appSettings: {
+        systemPrompt: appSettings.systemPrompt,
+        ownerPasscode: appSettings.ownerPasscode
+      }
+    });
+  } catch (err: any) {
+    console.error("Failed to compile admin summary:", err);
+    res.status(500).json({ error: "Failed to load admin summary stats" });
+  }
+});
+
+// Admin: Get specific User detailed logs
+app.get("/api/admin/user-details", checkAdminPasscode, (req: express.Request, res: express.Response): any => {
+  const { email } = req.query;
+  if (!email || typeof email !== 'string') {
+    return res.status(400).json({ error: "Email query param is required" });
+  }
+
+  const sanitizedEmail = email.toLowerCase().replace(/[^a-z0-9@._-]/g, "");
+  const filePath = path.join(USERS_DIR, `${sanitizedEmail}.json`);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "User data not found" });
+  }
+
+  try {
+    const data = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    res.json(data);
+  } catch (err) {
+    console.error(`Failed to load full admin user details for ${email}:`, err);
+    res.status(500).json({ error: "Failed to load detailed user logs" });
+  }
+});
+
+// Admin: Update Prompt & Settings
+app.post("/api/admin/settings/update", checkAdminPasscode, (req: express.Request, res: express.Response): any => {
+  const { systemPrompt, ownerPasscode } = req.body;
+
+  if (systemPrompt !== undefined) appSettings.systemPrompt = systemPrompt;
+  if (ownerPasscode !== undefined && ownerPasscode.trim() !== "") {
+    appSettings.ownerPasscode = ownerPasscode.trim();
+  }
+
+  try {
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(appSettings, null, 2), "utf8");
+    res.json({ success: true, message: "Settings updated successfully", appSettings });
+  } catch (err: any) {
+    console.error("Failed to save updated settings:", err);
+    res.status(500).json({ error: "Failed to persist updated settings on server" });
+  }
+});
 
 // Vite Server middleware integration
 async function startServer() {
